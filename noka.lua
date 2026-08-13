@@ -2,7 +2,7 @@
 
 -- Noka single-file build.
 -- The root Termux controller, helpers, and Delta LocalPlayer heartbeat are
--- carried in this file. Runtime configuration is stored under $HOME/NOKA.
+-- carried in this file. Runtime data is stored under /storage/emulated/0/Noka.
 -- First run in Termux 0.118.1:
 --   pkg install -y lua54 curl coreutils procps grep
 --   termux-setup-storage
@@ -793,7 +793,8 @@ if running_inside_roblox() then
     end
     return heartbeat_chunk()
 end
-local DATA_DIR = os.getenv("NOKA_DATA_DIR") or ((os.getenv("HOME") or ".") .. "/NOKA")
+local DATA_DIR = "/storage/emulated/0/Noka"
+local LEGACY_DATA_DIR = (os.getenv("HOME") or ".") .. "/NOKA"
 local CONFIG_PATH = DATA_DIR .. "/config.lua"
 local STATE_DIR = DATA_DIR .. "/state"
 local DEVICE_BACKUP_PATH = STATE_DIR .. "/device-backup.lua"
@@ -810,7 +811,6 @@ local STATUS_BAR_CLEARANCE = 8
 local FAILURE_CONFIRMATIONS = 3
 local MIN_HEARTBEAT_TIMEOUT = 30
 local TRANSITION_GRACE = 120
-local REGISTRATION_TIMEOUT = 45
 local WEBHOOK_AVATAR_URL = "https://cdn.discordapp.com/attachments/1476719698090397806/1537197131415167026/5s1b21v.png"
 local PLAY_STORE_PACKAGE = "com.android.vending"
 local BACKGROUND_OPS = { "RUN_IN_BACKGROUND", "RUN_ANY_IN_BACKGROUND", "WAKE_LOCK", "SYSTEM_ALERT_WINDOW" }
@@ -847,7 +847,6 @@ local function elevate_once()
     local environment = table.concat({
         "export HOME=" .. Core.shell_quote(user_home),
         "export PREFIX=" .. Core.shell_quote(prefix),
-        "export NOKA_DATA_DIR=" .. Core.shell_quote(DATA_DIR),
         "export PATH=" .. Core.shell_quote("/system/bin:/system/xbin:" .. prefix .. "/bin:" .. (os.getenv("PATH") or "")),
     }, "; ")
     local child = environment .. "; exec " .. Core.shell_quote(lua_binary) .. " "
@@ -885,6 +884,32 @@ local function ensure_directory(path)
 end
 
 ensure_directory(STATE_DIR)
+
+local function file_exists(path)
+    local handle = io.open(path, "r")
+    if not handle then return false end
+    handle:close()
+    return true
+end
+
+local function copy_file(source_path, destination_path)
+    local source_handle = io.open(source_path, "rb")
+    if not source_handle then return false end
+    local contents = source_handle:read("*a")
+    source_handle:close()
+    local destination_handle = io.open(destination_path, "wb")
+    if not destination_handle then return false end
+    destination_handle:write(contents)
+    destination_handle:close()
+    return true
+end
+
+if not file_exists(CONFIG_PATH) then
+    local legacy_config = LEGACY_DATA_DIR .. "/config.lua"
+    if file_exists(legacy_config) and copy_file(legacy_config, CONFIG_PATH) then
+        print("Noka migrated the existing configuration to " .. CONFIG_PATH)
+    end
+end
 
 local function log(level, message)
     local line = string.format("[%s] %-5s %s", os.date("%Y-%m-%d %H:%M:%S"), level, tostring(message))
@@ -1040,6 +1065,10 @@ local function save_config(config)
 end
 
 local config = load_config()
+if not file_exists(CONFIG_PATH) then
+    local saved, save_error = save_config(config)
+    if not saved then error("Noka could not create " .. CONFIG_PATH .. ": " .. tostring(save_error)) end
+end
 
 local function prompt(label, default)
     if default ~= nil and tostring(default) ~= "" then
@@ -1923,8 +1952,8 @@ local function restart_and_join(entry, state, reason)
 
     -- Do not overwrite the shared launch marker for the next clone until this
     -- clone's separate Autoexec heartbeat has claimed its package/token.
-    local registration_deadline = os.time() + REGISTRATION_TIMEOUT
-    while os.time() <= registration_deadline do
+    log("INFO", entry.package .. ": waiting for LocalPlayer heartbeat (press END to cancel)")
+    while true do
         if stop_requested() then return false end
         local heartbeat = read_heartbeat and read_heartbeat(entry.package, token) or nil
         if heartbeat and heartbeat.token == token
@@ -1935,9 +1964,6 @@ local function restart_and_join(entry, state, reason)
         end
         if not wait_or_stop(1) then return false end
     end
-    log("ERROR", entry.package .. ": heartbeat did not register within "
-        .. REGISTRATION_TIMEOUT .. " seconds; refusing to overwrite its launch marker")
-    return false
 end
 
 local function close_warm_tasks()
@@ -2091,7 +2117,7 @@ local function build_webhook_payload(runtime)
     end
     local timestamp = os.time()
     local description = table.concat({
-        "Last Updated: " .. os.date("%B %d at %H:%M", timestamp),
+        string.format("Last Updated: <t:%d:f>", timestamp),
         string.format("\n**Device Information:**\n📱┃Device: %s\n⚙️┃CPU: %.0f%%\n💾┃RAM: %d MB free",
             metrics.model, cpu_percent(), metrics.ram_free_mb),
         string.format("\n**Instance Status:**\n🤖┃Total: %d\n🟢┃Online: %d\n🔴┃Offline: %d",
