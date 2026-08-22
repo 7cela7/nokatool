@@ -1714,6 +1714,43 @@ done
     end
 end
 
+-- Rejoin: status updates are fresh messages by default; the single-message
+-- edit mode is an explicit opt-in (webhook_edit_enabled) with a 10 second
+-- floor instead of the 60 second new-message floor.
+local function effective_webhook_interval()
+    local interval = tonumber(config.webhook_interval) or 300
+    local minimum = config.webhook_edit_enabled and 10 or 60
+    return math.max(minimum, interval)
+end
+
+local function send_webhook(runtime)
+    if config.webhook_url == "" then return true end
+    local attempted_screenshot_path = temporary_path("noka-status") .. ".png"
+    local screenshot_ok = capture_screen(attempted_screenshot_path)
+    local screenshot_path = screenshot_ok and attempted_screenshot_path or nil
+    if not screenshot_ok then os.remove(attempted_screenshot_path) end
+    local payload_path = temporary_path("webhook-payload")
+    local payload = Core.json_encode(build_webhook_payload(runtime, screenshot_path ~= nil))
+    local payload_ok, payload_error = write_file(payload_path, payload, "wb")
+    if not payload_ok then
+        if screenshot_path then os.remove(screenshot_path) end
+        log("WARN", "Discord update could not be staged: " .. tostring(payload_error))
+        return false
+    end
+    os.execute("chmod 600 " .. Core.shell_quote(payload_path))
+
+    local response, code, request_error = discord_multipart(
+        "POST", config.webhook_url .. "?wait=true", payload_path, screenshot_path)
+    os.remove(payload_path)
+    if screenshot_path then os.remove(screenshot_path) end
+    if request_error or not code or code:sub(1, 1) ~= "2" then
+        log("WARN", string.format("Discord update failed (HTTP %s): %s",
+            tostring(code), tostring(request_error or response):sub(1, 240)))
+        return false
+    end
+    return true
+end
+
 local function stop_end_listener()
     if end_listener_pid then
         root("kill " .. tostring(end_listener_pid) .. " 2>/dev/null || true", true)
@@ -2924,6 +2961,11 @@ local wait_for_solver_result
 -- run_sequence probes them when no solver is configured.
 local cookie_db_path
 local read_roblosecurity
+-- Rejoin: screenshot/embed/HTTP helpers for Discord live below the menus;
+-- send_webhook (defined early) calls them when a status update fires.
+local capture_screen
+local build_webhook_payload
+local discord_multipart
 local launch_token_counter = 0
 
 local function new_launch_token()
@@ -3227,7 +3269,7 @@ local function cpu_percent()
     return math.max(0, math.min(100, percent))
 end
 
-local function capture_screen(path)
+capture_screen = function(path)
     local output, ok = root("screencap -p " .. Core.shell_quote(path), true)
     if not ok then return nil, output end
     root("chmod 0600 " .. Core.shell_quote(path), true)
@@ -3264,7 +3306,7 @@ local function format_total_uptime(seconds)
     return string.format("%dh", math.floor(seconds / 3600))
 end
 
-local function build_webhook_payload(runtime, include_image)
+build_webhook_payload = function(runtime, include_image)
     local metrics = system_metrics()
     local online = 0
     local details = {}
@@ -3314,7 +3356,7 @@ local function build_webhook_payload(runtime, include_image)
     return payload
 end
 
-local function discord_multipart(method, url, payload_path, screenshot_path)
+discord_multipart = function(method, url, payload_path, screenshot_path)
     local response_path = temporary_path("discord-response")
     local config_path = temporary_path("discord-curl")
     local lines = {
@@ -3341,42 +3383,6 @@ local function discord_multipart(method, url, payload_path, screenshot_path)
     return response, status
 end
 
--- Rejoin: status updates are fresh messages by default; the single-message
--- edit mode is an explicit opt-in (webhook_edit_enabled) with a 10 second
--- floor instead of the 60 second new-message floor.
-local function effective_webhook_interval()
-    local interval = tonumber(config.webhook_interval) or 300
-    local minimum = config.webhook_edit_enabled and 10 or 60
-    return math.max(minimum, interval)
-end
-
-local function send_webhook(runtime)
-    if config.webhook_url == "" then return true end
-    local attempted_screenshot_path = temporary_path("noka-status") .. ".png"
-    local screenshot_ok = capture_screen(attempted_screenshot_path)
-    local screenshot_path = screenshot_ok and attempted_screenshot_path or nil
-    if not screenshot_ok then os.remove(attempted_screenshot_path) end
-    local payload_path = temporary_path("webhook-payload")
-    local payload = Core.json_encode(build_webhook_payload(runtime, screenshot_path ~= nil))
-    local payload_ok, payload_error = write_file(payload_path, payload, "wb")
-    if not payload_ok then
-        if screenshot_path then os.remove(screenshot_path) end
-        log("WARN", "Discord update could not be staged: " .. tostring(payload_error))
-        return false
-    end
-    os.execute("chmod 600 " .. Core.shell_quote(payload_path))
-
-    local response, code, request_error = discord_multipart(
-        "POST", config.webhook_url .. "?wait=true", payload_path, screenshot_path)
-    os.remove(payload_path)
-    if screenshot_path then os.remove(screenshot_path) end
-    if request_error or not code or code:sub(1, 1) ~= "2" then
-        log("WARN", string.format("Discord update failed (HTTP %s): %s",
-            tostring(code), tostring(request_error or response):sub(1, 240)))
-        return false
-    end
-    return true
-end
 
 local function verify_configuration()
     if type(config.packages) ~= "table" then return nil, "configured packages must be a list" end
