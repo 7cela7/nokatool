@@ -1680,24 +1680,21 @@ local function start_end_listener()
     end
     local watcher = [==[
 parent_pid=]==] .. tostring(parent_pid) .. [==[
+logfile=]==] .. Core.shell_quote(LOG_PATH) .. [==[
 while true; do
     kill -0 "$parent_pid" 2>/dev/null || exit 0
     key=''
-    IFS= read -r -s -n 1 -t 0.5 key </dev/tty || continue
+    if ! IFS= read -r -s -n 1 -t 0.5 key </dev/tty 2>/dev/null; then
+        IFS= read -r -s -n 1 -t 0.5 key || continue
+    fi
     if [[ "$key" == $'\e' ]]; then
-        rest=''
-        IFS= read -r -s -n 2 -t 0.4 rest </dev/tty || true
-        if [[ "$rest" == '[F' || "$rest" == 'OF' ]]; then
-            printf 'END\n' > ]==] .. Core.shell_quote(STOP_REQUEST_PATH) .. [==[
-            exit 0
-        elif [[ "$rest" == '[4' ]]; then
-            tail=''
-            IFS= read -r -s -n 1 -t 0.2 tail </dev/tty || true
-            if [[ "$tail" == '~' ]]; then
-                printf 'END\n' > ]==] .. Core.shell_quote(STOP_REQUEST_PATH) .. [==[
-                exit 0
-            fi
-        fi
+        # Any escape byte counts as the stop key (END sends ESC[F, some
+        # keyboards send ESC[4~ or a bare ESC). Flush continuation bytes.
+        flushed=''
+        IFS= read -r -s -n 4 -t 0.05 flushed </dev/tty 2>/dev/null || true
+        printf 'END\n' > ]==] .. Core.shell_quote(STOP_REQUEST_PATH) .. [==[
+        printf '[%s] INFO  Stop key captured (%s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${flushed:-plain ESC}" >> "$logfile" 2>/dev/null
+        exit 0
     fi
 done
 ]==]
@@ -3060,6 +3057,7 @@ local function restart_and_join(entry, state, reason)
             and heartbeat.timestamp and heartbeat.timestamp >= state.last_launch - 5 then
             state.heartbeat = heartbeat
             state.online = true
+            state.registered_once = true
             log("INFO", entry.package .. ": LocalPlayer heartbeat registered")
             return true
         end
@@ -3665,6 +3663,7 @@ local function run_sequence(once)
             end
             if not opened then
                 terminate_clone(entry)
+                state.gave_up = true
                 still_stopped[#still_stopped + 1] = entry.package
                 log("ERROR", entry.package .. ": could not be cleared and relaunched; it stays stopped until supervision picks it up")
             end
@@ -3808,22 +3807,31 @@ local function run_sequence(once)
         -- Rejoin: the first status update waits until every clone's heartbeat
         -- has registered, plus a random 30-45 second settling window on top.
         if first_status_gate == nil then
-            local all_registered = true
+            local all_settled = true
             for _, entry in ipairs(config.packages) do
                 local clone_state = runtime[entry.package]
-                if type(clone_state) ~= "table" or not clone_state.online then
-                    all_registered = false
+                if type(clone_state) ~= "table" then
+                    all_settled = false
+                    break
+                end
+                -- A clone counts as settled once its heartbeat registered, or
+                -- when it was intentionally left stopped after failed passes;
+                -- a permanently broken clone must never silence Discord.
+                if not clone_state.registered_once and not clone_state.gave_up then
+                    all_settled = false
                     break
                 end
             end
-            if all_registered then
+            if all_settled then
                 first_status_gate = os.time() + math.random(30, 45)
                 log("INFO", string.format(
                     "Every heartbeat is registered; first status update in %d second(s)",
                     first_status_gate - os.time()))
             end
         end
-        local webhook_now = uptime_seconds() or os.time()
+        -- Everything here runs on wall-clock time; mixing in uptime seconds
+        -- made this comparison false forever (the silent-webhook bug).
+        local webhook_now = os.time()
         if config.webhook_url ~= "" and first_status_gate ~= nil and webhook_now >= first_status_gate
             and webhook_now - last_webhook >= effective_webhook_interval() then
             send_webhook(runtime)
