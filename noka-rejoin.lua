@@ -1207,6 +1207,42 @@ local function detect_solver_type(url)
     return "universal"
 end
 
+-- Normalizes whatever the user pasted as a highspec URL into the documented
+-- API base (https://api.highspec.gg/api/v1), extracting the API key from the
+-- query string when it was embedded there. Returns base, embedded_query
+-- (without the api_key pair) and the key found in the URL (callers merge in
+-- the separately configured solver key).
+local function highspec_prepare(url)
+    local base, query = tostring(url):match("^([^?]+)(%?.*)$")
+    base = (base or tostring(url)):gsub("/+$", "")
+    query = query and query:sub(2) or ""
+    -- Strip pasted endpoint tails so they are not doubled.
+    for _ = 1, 4 do
+        local shorter = base:match("^(.*)/external$")
+            or base:match("^(.*)/external/job$")
+            or base:match("^(.*)/external/job/captcha$")
+            or base:match("^(.*)/external/job/captcha/submit$")
+        if not shorter then break end
+        base = shorter
+    end
+    if base:find("highspec", 1, true) and not base:match("/api/v1$") then
+        base = base .. "/api/v1"
+    end
+    local url_key = ""
+    local extras = {}
+    for pair in query:gmatch("[^&]+") do
+        local qname, qvalue = pair:match("^([^=]+)=?(.*)$")
+        if qname then
+            if qname:lower() == "api_key" and qvalue ~= "" then
+                url_key = Core.url_decode(qvalue)
+            else
+                extras[#extras + 1] = pair
+            end
+        end
+    end
+    return base, table.concat(extras, "&"), url_key
+end
+
 local executor_layout_cache
 local function discover_executor_layout(refresh)
     if executor_layout_cache and not refresh then return executor_layout_cache end
@@ -1719,6 +1755,12 @@ local function effective_webhook_interval()
     local minimum = config.webhook_edit_enabled and 10 or 60
     return math.max(minimum, interval)
 end
+
+-- Rejoin: screenshot/embed/HTTP helpers for Discord live further down in the
+-- solver section; forward declarations keep them visible to send_webhook.
+local capture_screen
+local build_webhook_payload
+local discord_multipart
 
 local function send_webhook(runtime)
     if config.webhook_url == "" then return true end
@@ -2958,11 +3000,6 @@ local wait_for_solver_result
 -- run_sequence probes them when no solver is configured.
 local cookie_db_path
 local read_roblosecurity
--- Rejoin: screenshot/embed/HTTP helpers for Discord live below the menus;
--- send_webhook (defined early) calls them when a status update fires.
-local capture_screen
-local build_webhook_payload
-local discord_multipart
 local launch_token_counter = 0
 
 local function new_launch_token()
@@ -4069,22 +4106,32 @@ end
 
 -- highspec is job-based: submit once, then poll the job to a terminal state.
 local function solve_highspec(entry, base_url, username, cookie)
-    local base, embedded_query = base_url:match("^([^?]+)(%?.*)$")
-    base = (base or base_url):gsub("/+$", "")
-    embedded_query = embedded_query and embedded_query:sub(2) or ""
-    local submit_query = "service=directapi"
+    -- The documented base is https://api.highspec.gg/api/v1; whatever the
+    -- user pasted gets normalized, and the key comes from the config field
+    -- or the pasted query string. The key travels as a query parameter AND
+    -- as a header, since the API accepts all three auth styles.
+    local base, embedded_query, url_key = highspec_prepare(base_url)
+    local key = Core.trim(config.solver_key or "")
+    if key == "" then key = url_key end
+    if key == "" then
+        log("ERROR", entry.package .. ": highspec needs an API key; set the solver key in Configuration")
+        return false
+    end
+    local submit_query = "service=directapi&api_key=" .. Core.url_encode(key)
     if embedded_query ~= "" then submit_query = submit_query .. "&" .. embedded_query end
+    local headers = { "X-API-Key: " .. key }
     local submit_url = base .. "/external/job/captcha/submit?" .. submit_query
-    local headers = {}
     local body, code, submit_error = http_post_json(submit_url,
         { note = "Noka Rejoin", accounts = Core.json_array({ { username = username, cookie = cookie } }) },
         headers, 60)
+    -- Responses are wrapped: { status = 201, data = { id = "...", ... } }.
     local submitted = Core.json_decode(body or "")
-    local job_id = type(submitted) == "table" and submitted.id or nil
+    local data = type(submitted) == "table" and (type(submitted.data) == "table" and submitted.data or submitted) or nil
+    local job_id = type(data) == "table" and data.id or nil
     if type(job_id) == "number" then job_id = tostring(job_id) end
     if type(job_id) ~= "string" or job_id == "" then
         log("ERROR", string.format("%s: highspec submit failed (HTTP %s): %s",
-            entry.package, tostring(code), tostring(submit_error or body):sub(1, 160)))
+            entry.package, tostring(code), tostring(submit_error or body):sub(1, 200)))
         return false
     end
     local started = uptime_seconds() or os.time()
@@ -4092,12 +4139,15 @@ local function solve_highspec(entry, base_url, username, cookie)
         if stop_requested() then return false end
         if not wait_or_stop(5) then return false end
         local status_url = base .. "/external/job/" .. Core.url_encode(job_id)
-        if embedded_query ~= "" then status_url = status_url .. "?" .. embedded_query end
+            .. "?api_key=" .. Core.url_encode(key)
         local sbody, status_code, status_error = http_get(status_url, 30, headers)
-        local status_body = Core.json_decode(sbody or "")
-        local status = type(status_body) == "table" and tostring(status_body.status or ""):lower() or ""
+        local status_response = Core.json_decode(sbody or "")
+        local status_data = type(status_response) == "table"
+            and (type(status_response.data) == "table" and status_response.data or status_response) or nil
+        local status = type(status_data) == "table" and tostring(status_data.status or ""):lower() or ""
         if status == "completed" then
-            local success_amount = tonumber(status_body.success_amount) or 0
+            local success_amount = type(status_data) == "table"
+                and (tonumber(status_data.success_amount) or 0) or 0
             if success_amount >= 1 then
                 log("INFO", entry.package .. ": solver reports the account is clear")
                 return true
@@ -4156,10 +4206,6 @@ end
 local SOLVER_DIR = STATE_DIR .. "/solver"
 local async_solver_jobs = {}
 
-local function solver_safe_name(package_name)
-    return tostring(package_name):gsub("[^%w%._%-]", "_")
-end
-
 local function cleanup_solver_files(job)
     if job.cfg_path then os.remove(job.cfg_path); job.cfg_path = nil end
     -- The request body holds the account cookie; remove it as soon as the
@@ -4194,25 +4240,35 @@ spawn_background_solver = function(entry, known_username)
     if stype == "highspec" then
         -- highspec answers its submit immediately with a job id; polling the
         -- job later is what makes this path asynchronous.
-        local base, embedded_query = url:match("^([^?]+)(%?.*)$")
-        base = (base or url):gsub("/+$", "")
-        embedded_query = embedded_query and embedded_query:sub(2) or ""
-        local submit_query = "service=directapi"
+        local base, embedded_query, url_key = highspec_prepare(url)
+        local hs_key = Core.trim(config.solver_key or "")
+        if hs_key == "" then hs_key = url_key end
+        if hs_key == "" then
+            log("ERROR", entry.package .. ": highspec needs an API key; set the solver key in Configuration")
+            return false
+        end
+        local submit_query = "service=directapi&api_key=" .. Core.url_encode(hs_key)
         if embedded_query ~= "" then submit_query = submit_query .. "&" .. embedded_query end
+        local headers = { "X-API-Key: " .. hs_key }
         local body, code, submit_error = http_post_json(
             base .. "/external/job/captcha/submit?" .. submit_query,
             { note = "Noka Rejoin", accounts = Core.json_array({ { username = username, cookie = cookie } }) },
-            {}, 60)
+            headers, 60)
+        -- Responses are wrapped: { status = 201, data = { id = "...", ... } }.
         local submitted = Core.json_decode(body or "")
-        local job_id = type(submitted) == "table" and submitted.id or nil
+        local data = type(submitted) == "table" and (type(submitted.data) == "table" and submitted.data or submitted) or nil
+        local job_id = type(data) == "table" and data.id or nil
         if type(job_id) == "number" then job_id = tostring(job_id) end
         if type(job_id) ~= "string" or job_id == "" then
             log("ERROR", string.format("%s: highspec submit failed (HTTP %s): %s",
-                entry.package, tostring(code), tostring(submit_error or body):sub(1, 160)))
+                entry.package, tostring(code), tostring(submit_error or body):sub(1, 200)))
             return false
         end
         async_solver_jobs[entry.package] = {
-            kind = "highspec", job_id = job_id, base = base, query = embedded_query,
+            kind = "highspec", job_id = job_id, base = base,
+            query = "api_key=" .. Core.url_encode(hs_key)
+                .. (embedded_query ~= "" and "&" .. embedded_query or ""),
+            api_key = hs_key,
             deadline = os.time() + math.max(60, tonumber(config.solver_wait_timeout) or 600),
         }
         log("INFO", entry.package .. ": account queued with the highspec solver (job " .. job_id .. ")")
@@ -4223,8 +4279,19 @@ spawn_background_solver = function(entry, known_username)
     -- universal): stage one blocking POST and detach it so the controller
     -- never waits on the solve while other clones keep launching.
     local key = Core.trim(config.solver_key or "")
+    local target_url = url
+    local extra_headers = {}
     local payload_table = { username = username, cookie = cookie }
-    if key ~= "" then payload_table.api_key = key end
+    if stype == "zapzonex" then
+        -- Zapzonex authenticates with a Bearer token against /v1/solve.
+        local zap_host = url:match("^https?://([^/%?#]+)") or "zapzonex.net"
+        target_url = "https://" .. zap_host .. "/v1/solve"
+        if key ~= "" then
+            extra_headers[#extra_headers + 1] = "Authorization: Bearer " .. key
+        end
+    else
+        if key ~= "" then payload_table.api_key = key end
+    end
     local place_id = entry.target and entry.target.place_id or nil
     if place_id then payload_table.placeId = tonumber(place_id) or place_id end
     local encoded_ok, payload = pcall(Core.json_encode, payload_table)
@@ -4233,7 +4300,7 @@ spawn_background_solver = function(entry, known_username)
         return false
     end
     ensure_directory(SOLVER_DIR)
-    local safe = solver_safe_name(entry.package)
+    local safe = tostring(entry.package):gsub("[^%w%._%-]", "_")
     local stamp = tostring(os.time())
     -- Unique paths per submission: an orphaned older curl can never deliver
     -- its late answer into the current job's slot.
@@ -4245,11 +4312,14 @@ spawn_background_solver = function(entry, known_username)
         "connect-timeout = 15",
         "max-time = " .. tostring(math.max(60, tonumber(config.solver_wait_timeout) or 600)),
         "max-filesize = 10485760",
-        "url = " .. assert(curl_config_quote(url)),
+        "url = " .. assert(curl_config_quote(target_url)),
         "output = " .. assert(curl_config_quote(body_path)),
         'write-out = "%{http_code}"',
     }
-    if key ~= "" then
+    for _, header in ipairs(extra_headers) do
+        config_lines[#config_lines + 1] = "header = " .. assert(curl_config_quote(header))
+    end
+    if key ~= "" and stype ~= "zapzonex" then
         config_lines[#config_lines + 1] = "header = " .. assert(curl_config_quote("X-API-Key: " .. key))
     end
     local written, write_error = write_file(body_path, payload, "wb")
@@ -4288,7 +4358,8 @@ read_solver_result = function(entry)
     if job.kind == "highspec" then
         local status_url = job.base .. "/external/job/" .. Core.url_encode(job.job_id)
         if job.query ~= "" then status_url = status_url .. "?" .. job.query end
-        local sbody, _, status_error = http_get(status_url, 20)
+        local poll_headers = job.api_key and { "X-API-Key: " .. job.api_key } or nil
+        local sbody, _, status_error = http_get(status_url, 20, poll_headers)
         local response = Core.json_decode(sbody or "")
         local data = type(response) == "table" and (type(response.data) == "table" and response.data or response) or nil
         local status = type(data) == "table" and tostring(data.status or ""):lower() or ""
