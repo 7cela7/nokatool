@@ -1,15 +1,23 @@
 --[[
-    Noka LocalPlayer heartbeat 4.1
+    Noka LocalPlayer heartbeat 5.0
 
-    Installed by Noka as a separate Delta Autoexec/Autoexecute script.
-    It contains no licensing, HWID collection, remote requests, analytics,
-    or downloaded code. Communication is local Delta Workspace files only.
+    Installed by Noka as a single, self-contained Delta/Arceus Autoexecute script.
+    It contains no licensing, HWID collection, remote requests, analytics, or
+    downloaded code, and it never modifies its own source. Every piece of state
+    is written to external workspace files only, so it survives Luraph
+    obfuscation and Roblox VM teardown.
 
-    4.0: bounded controller registration, strict marker validation, and
-    deterministic connection cleanup after replacement.
+    5.0 states: "active", "teleporting", "loading", "disconnected".
+      - "active"       healthy, in a server
+      - "teleporting"  written synchronously the instant a serverhop begins
+      - "loading"      injected, still loading the place
+      - "disconnected" a Roblox ErrorPrompt is confirmed visible
+
+    4.0: bounded controller registration and strict marker validation.
     4.1: instance-property reads are exception-proofed and the writer thread
-    survives per-tick errors, so a Roblox place-teardown race can never kill
-    the heartbeat silently.
+         survives per-tick errors, so a place-teardown race cannot kill it.
+    5.0: explicit state machine, pre-teleport hook, and per-UserID marker
+         selection so a re-injected clone cannot adopt another clone's marker.
 ]]
 
 local Players = game:GetService("Players")
@@ -17,6 +25,8 @@ local HttpService = game:GetService("HttpService")
 
 local HEARTBEAT_INTERVAL = 4
 local INITIAL_LOADING_GRACE = 12
+local TELEPORT_GRACE = 180
+local MARKER_PLAYER_WAIT = 8
 local STATE_KEY = "__NOKA_LOCALPLAYER_HEARTBEAT_V3"
 local task_library = task
 local wait_for = task_library and task_library.wait or wait
@@ -55,13 +65,25 @@ local function ensure_folder(path)
     return pcall(makefolder, path)
 end
 
-local function decode_marker(contents)
+local function current_user_id()
+    local player = Players.LocalPlayer
+    if not player then return nil end
+    local ok, value = pcall(function() return player.UserId end)
+    if ok and type(value) == "number" then return value end
+    return nil
+end
+
+local function decode_marker(contents, require_fresh)
     local ok, marker = pcall(HttpService.JSONDecode, HttpService, contents)
     if not ok or type(marker) ~= "table" then return nil end
     if type(marker.package) ~= "string" or marker.package == "" then return nil end
     if type(marker.token) ~= "string" or marker.token == "" then return nil end
-    if type(marker.launched_at) ~= "number" then return nil end
-    if math.abs(os.time() - marker.launched_at) > 1800 then return nil end
+    if require_fresh then
+        -- A shared marker is only trustworthy while it is young; a per-UserID
+        -- marker is bound to this clone and never expires.
+        if type(marker.launched_at) ~= "number" then return nil end
+        if math.abs(os.time() - marker.launched_at) > 1800 then return nil end
+    end
     return marker
 end
 
@@ -77,26 +99,52 @@ local HEARTBEAT_DIRS = {
     "../../workspace/Noka",
 }
 
-local function read_launch_marker()
-    local candidates = {
-        "Noka/current_launch.json",
-        "Workspace/Noka/current_launch.json",
-        "workspace/Noka/current_launch.json",
-        "../Workspace/Noka/current_launch.json",
-        "../workspace/Noka/current_launch.json",
-        "../../Workspace/Noka/current_launch.json",
-        "../../workspace/Noka/current_launch.json",
+local GENERIC_MARKER_PATHS = {
+    "Noka/current_launch.json",
+    "Workspace/Noka/current_launch.json",
+    "workspace/Noka/current_launch.json",
+    "../Workspace/Noka/current_launch.json",
+    "../workspace/Noka/current_launch.json",
+    "../../Workspace/Noka/current_launch.json",
+    "../../workspace/Noka/current_launch.json",
+}
+
+local function user_marker_paths(user_id)
+    local leaf = "launch_" .. tostring(user_id) .. ".json"
+    return {
+        "Noka/" .. leaf,
+        "Workspace/Noka/" .. leaf,
+        "workspace/Noka/" .. leaf,
+        "../Workspace/Noka/" .. leaf,
+        "../workspace/Noka/" .. leaf,
+        "../../Workspace/Noka/" .. leaf,
+        "../../workspace/Noka/" .. leaf,
     }
-    for _, path in ipairs(candidates) do
+end
+
+local function path_dir(path)
+    return path:match("^(.*)/[^/]+$") or "Noka"
+end
+
+local function read_launch_marker()
+    -- Prefer this clone's own marker, identified by Roblox UserId. The shared
+    -- current_launch.json is only a fallback, because another clone may have
+    -- overwritten it by the time a serverhop re-injects this script.
+    local user_id = current_user_id()
+    if user_id then
+        for _, path in ipairs(user_marker_paths(user_id)) do
+            local contents = safe_read(path)
+            if contents then
+                local marker = decode_marker(contents, false)
+                if marker then return marker, path_dir(path) end
+            end
+        end
+    end
+    for _, path in ipairs(GENERIC_MARKER_PATHS) do
         local contents = safe_read(path)
         if contents then
-            local marker = decode_marker(contents)
-            if marker then
-                -- Return where it was found, so the heartbeat is written beside
-                -- it whichever root the executor's file API is relative to.
-                local directory = path:match("^(.*)/[^/]+$") or "Noka"
-                return marker, directory
-            end
+            local marker = decode_marker(contents, true)
+            if marker then return marker, path_dir(path) end
         end
     end
     return nil, nil
@@ -108,8 +156,14 @@ if type(previous) == "table" then
     if previous.teleport_connection then pcall(previous.teleport_connection.Disconnect, previous.teleport_connection) end
 end
 
--- A state surviving a Roblox teleport belongs to this clone. Retaining that
--- package/token prevents another clone's shared launch marker being adopted.
+-- Wait briefly for the LocalPlayer so a serverhop re-injection can select this
+-- clone's own per-UserID marker instead of the shared current_launch.json.
+local player_wait = 0
+while player_wait < MARKER_PLAYER_WAIT and not Players.LocalPlayer do
+    wait_for(0.5)
+    player_wait = player_wait + 0.5
+end
+
 local marker = type(previous) == "table" and previous.marker or nil
 local marker_dir = type(previous) == "table" and previous.marker_dir or nil
 if type(marker) ~= "table" then
@@ -164,6 +218,9 @@ local function begin_transition(extra_seconds)
     state.loading_until = math.max(state.loading_until or 0, now + (extra_seconds or INITIAL_LOADING_GRACE))
 end
 
+-- Forward-declared so the teleport hook can persist a heartbeat synchronously.
+local write_heartbeat
+
 local function bind_teleport_event(player)
     if player == state.bound_player then return end
     if state.teleport_connection then
@@ -175,9 +232,13 @@ local function bind_teleport_event(player)
     local ok, connection = pcall(function()
         return player.OnTeleport:Connect(function()
             -- A new hop starts a new transition window; without this reset a
-            -- long chain of teleports looks like one stuck 120s+ transition.
+            -- long chain of teleports looks like one stuck transition.
             state.transition_started_at = os.time()
-            begin_transition(120)
+            state.loading_until = math.max(state.loading_until or 0, os.time() + TELEPORT_GRACE)
+            -- The Roblox VM is torn down around a teleport, so the periodic
+            -- writer will never get another tick. Persist TELEPORTING now so the
+            -- controller knows the upcoming heartbeat gap is intentional.
+            pcall(function() write_heartbeat("teleporting", "serverhop") end)
         end)
     end)
     if ok then state.teleport_connection = connection end
@@ -256,16 +317,18 @@ local function visible_disconnect_prompt()
     return true, reason or "Roblox ErrorPrompt visible"
 end
 
-local function write_heartbeat(health, reason)
+write_heartbeat = function(health, reason)
     if type(writefile) ~= "function" then return false, "writefile is unavailable" end
     local now = os.time()
     local player = sample_local_player()
     local loaded = game_is_loaded()
 
-    if not loaded or not player then begin_transition(30) end
-    local loading = not loaded or not player or now < (state.loading_until or 0)
-    if not loading then state.transition_started_at = nil end
-    if health ~= "disconnected" then health = loading and "loading" or "online" end
+    if health ~= "teleporting" and health ~= "disconnected" then
+        if not loaded or not player then begin_transition(30) end
+        local loading = not loaded or not player or now < (state.loading_until or 0)
+        if not loading then state.transition_started_at = nil end
+        health = loading and "loading" or "active"
+    end
 
     state.sequence = (state.sequence or 0) + 1
     local payload = {
@@ -275,7 +338,7 @@ local function write_heartbeat(health, reason)
         sequence = state.sequence,
         state = health,
         online = health ~= "disconnected",
-        transitioning = health == "loading",
+        transitioning = health == "loading" or health == "teleporting",
         transition_started_at = state.transition_started_at,
         player_ready = player ~= nil,
         player = state.last_player_name,
