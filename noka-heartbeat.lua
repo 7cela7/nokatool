@@ -1,25 +1,3 @@
---[[
-    Noka LocalPlayer heartbeat 5.0
-
-    Installed by Noka as a single, self-contained Delta/Arceus Autoexecute script.
-    It contains no licensing, HWID collection, remote requests, analytics, or
-    downloaded code, and it never modifies its own source. Every piece of state
-    is written to external workspace files only, so it survives Luraph
-    obfuscation and Roblox VM teardown.
-
-    5.0 states: "active", "teleporting", "loading", "disconnected".
-      - "active"       healthy, in a server
-      - "teleporting"  written synchronously the instant a serverhop begins
-      - "loading"      injected, still loading the place
-      - "disconnected" a Roblox ErrorPrompt is confirmed visible
-
-    4.0: bounded controller registration and strict marker validation.
-    4.1: instance-property reads are exception-proofed and the writer thread
-         survives per-tick errors, so a place-teardown race cannot kill it.
-    5.0: explicit state machine, pre-teleport hook, and per-UserID marker
-         selection so a re-injected clone cannot adopt another clone's marker.
-]]
-
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 
@@ -49,8 +27,6 @@ local shared = environment()
 
 local function safe_read(path)
     if type(readfile) ~= "function" then return nil end
-    -- Do not require isfile(): some executors omit it, and requiring it made the
-    -- marker unreadable even though readfile itself worked.
     local ok, contents = pcall(readfile, path)
     if ok and type(contents) == "string" then return contents end
     return nil
@@ -79,16 +55,12 @@ local function decode_marker(contents, require_fresh)
     if type(marker.package) ~= "string" or marker.package == "" then return nil end
     if type(marker.token) ~= "string" or marker.token == "" then return nil end
     if require_fresh then
-        -- A shared marker is only trustworthy while it is young; a per-UserID
-        -- marker is bound to this clone and never expires.
         if type(marker.launched_at) ~= "number" then return nil end
         if math.abs(os.time() - marker.launched_at) > 1800 then return nil end
     end
     return marker
 end
 
--- Every root the marker might be located under, relative to the executor's file
--- API. Used for reads and, defensively, for writes.
 local HEARTBEAT_DIRS = {
     "Noka",
     "Workspace/Noka",
@@ -152,10 +124,6 @@ local function read_launch_marker()
             end
         end
     end
-    -- The shared marker is written immediately before a launch, so when it names
-    -- this clone's package it carries the current token and must win over a
-    -- per-UserID marker left over from an earlier session. When it names another
-    -- clone (or is missing/stale) our own marker is the only correct identity.
     if generic_marker and (not user_marker or generic_marker.package == user_marker.package) then
         return generic_marker, generic_dir
     end
@@ -171,8 +139,6 @@ if type(previous) == "table" then
     if previous.teleport_connection then pcall(previous.teleport_connection.Disconnect, previous.teleport_connection) end
 end
 
--- Wait briefly for the LocalPlayer so a serverhop re-injection can select this
--- clone's own per-UserID marker instead of the shared current_launch.json.
 local player_wait = 0
 while player_wait < MARKER_PLAYER_WAIT and not Players.LocalPlayer do
     wait_for(0.5)
@@ -182,9 +148,6 @@ end
 local marker = type(previous) == "table" and previous.marker or nil
 local marker_dir = type(previous) == "table" and previous.marker_dir or nil
 if type(marker) ~= "table" then
-    -- The controller writes the marker immediately before this clone boots, but
-    -- an executor can attach a moment early. Retry briefly instead of giving up,
-    -- because giving up here means the controller never sees a heartbeat.
     for _ = 1, 20 do
         marker, marker_dir = read_launch_marker()
         if type(marker) == "table" then break end
@@ -218,8 +181,6 @@ local function safe_name(value)
     return tostring(value):gsub("[^%w%._%-]", "_")
 end
 
--- Create every candidate folder up front so a write can never fail merely
--- because the directory was missing.
 for _, directory in ipairs(HEARTBEAT_DIRS) do
     ensure_folder(directory)
     ensure_folder(directory .. "/heartbeats")
@@ -233,7 +194,6 @@ local function begin_transition(extra_seconds)
     state.loading_until = math.max(state.loading_until or 0, now + (extra_seconds or INITIAL_LOADING_GRACE))
 end
 
--- Forward-declared so the teleport hook can persist a heartbeat synchronously.
 local write_heartbeat
 
 local function bind_teleport_event(player)
@@ -246,21 +206,14 @@ local function bind_teleport_event(player)
     if not player then return end
     local ok, connection = pcall(function()
         return player.OnTeleport:Connect(function()
-            -- A new hop starts a new transition window; without this reset a
-            -- long chain of teleports looks like one stuck transition.
             state.transition_started_at = os.time()
             state.loading_until = math.max(state.loading_until or 0, os.time() + TELEPORT_GRACE)
-            -- The Roblox VM is torn down around a teleport, so the periodic
-            -- writer will never get another tick. Persist TELEPORTING now so the
-            -- controller knows the upcoming heartbeat gap is intentional.
             pcall(function() write_heartbeat("teleporting", "serverhop") end)
         end)
     end)
     if ok then state.teleport_connection = connection end
 end
 
--- Reading a property off an instance that Roblox is tearing down can throw;
--- a missing value must degrade the sample, never kill the heartbeat thread.
 local function safe_property(instance, key)
     local ok, value = pcall(function()
         return instance[key]
@@ -270,8 +223,6 @@ local function safe_property(instance, key)
 end
 
 local function sample_local_player()
-    -- Roblox replaces LocalPlayer during place transitions. Always fetch the
-    -- current object; never interpret the old object's Parent as a failure.
     local player = Players.LocalPlayer
     bind_teleport_event(player)
     if player then
@@ -309,8 +260,6 @@ local function visible_disconnect_prompt()
     local error_prompt = overlay:FindFirstChild("ErrorPrompt")
     if not error_prompt or not error_prompt.Visible then return false end
 
-    -- Hidden prompt templates elsewhere in promptOverlay are deliberately not
-    -- scanned because they previously caused false disconnect detections.
     local reason
     local descendants_ok, descendants = pcall(error_prompt.GetDescendants, error_prompt)
     if descendants_ok then
@@ -367,10 +316,6 @@ write_heartbeat = function(health, reason)
     local encoded_ok, body = pcall(HttpService.JSONEncode, HttpService, payload)
     if not encoded_ok then return false, tostring(body) end
 
-    -- Some executors root writefile differently from readfile, so write beside
-    -- the marker AND under every candidate root. The controller reads one of
-    -- these exact paths, so at least one copy lands where it is watching. A pair
-    -- of copies per location survives a read during a replace.
     local wrote = false
     local last_error = nil
     for _, directory in ipairs(HEARTBEAT_DIRS) do
@@ -398,8 +343,6 @@ spawn_task(function()
         local now = os.time()
         if now >= next_write then
             next_write = now + HEARTBEAT_INTERVAL
-            -- One thrown error must never kill the writer thread: the
-            -- controller can only see this file, so silence equals death.
             local tick_ok, tick_error = pcall(function()
                 local prompt_visible, reason = false, nil
                 local checked, check_error = pcall(function()
@@ -415,8 +358,6 @@ spawn_task(function()
                     warn("[NOKA] Disconnect check failed: " .. tostring(check_error))
                 end
 
-                -- The Roblox prompt must remain visible for two heartbeat samples;
-                -- a one-frame/template flash cannot mark the clone disconnected.
                 local health = state.prompt_hits >= 2 and "disconnected" or nil
                 local written, write_error = write_heartbeat(health, health and reason or nil)
                 if not written and not write_warning_sent then
