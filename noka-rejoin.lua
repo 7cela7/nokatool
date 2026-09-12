@@ -37,23 +37,21 @@ end
 
 local shared = environment()
 
-local function safe_is_file(path)
-    if type(isfile) ~= "function" then return false end
-    local ok, result = pcall(isfile, path)
-    return ok and result == true
-end
-
 local function safe_read(path)
-    if type(readfile) ~= "function" or not safe_is_file(path) then return nil end
+    if type(readfile) ~= "function" then return nil end
+    -- Do not require isfile(): some executors omit it, and requiring it made the
+    -- marker unreadable even though readfile itself worked.
     local ok, contents = pcall(readfile, path)
     if ok and type(contents) == "string" then return contents end
     return nil
 end
 
 local function ensure_folder(path)
-    if type(isfolder) ~= "function" or type(makefolder) ~= "function" then return false end
-    local ok, exists = pcall(isfolder, path)
-    if ok and exists then return true end
+    if type(isfolder) == "function" then
+        local ok, exists = pcall(isfolder, path)
+        if ok and exists then return true end
+    end
+    if type(makefolder) ~= "function" then return false end
     return pcall(makefolder, path)
 end
 
@@ -66,6 +64,18 @@ local function decode_marker(contents)
     if math.abs(os.time() - marker.launched_at) > 1800 then return nil end
     return marker
 end
+
+-- Every root the marker might be located under, relative to the executor's file
+-- API. Used for reads and, defensively, for writes.
+local HEARTBEAT_DIRS = {
+    "Noka",
+    "Workspace/Noka",
+    "workspace/Noka",
+    "../Workspace/Noka",
+    "../workspace/Noka",
+    "../../Workspace/Noka",
+    "../../workspace/Noka",
+}
 
 local function read_launch_marker()
     local candidates = {
@@ -135,15 +145,18 @@ local state = {
 }
 shared[STATE_KEY] = state
 
-ensure_folder(marker_dir)
-ensure_folder(marker_dir .. "/heartbeats")
-
 local function safe_name(value)
     return tostring(value):gsub("[^%w%._%-]", "_")
 end
 
-local heartbeat_path = marker_dir .. "/heartbeats/" .. safe_name(marker.package) .. ".json"
-local redundant_path = heartbeat_path .. ".next"
+-- Create every candidate folder up front so a write can never fail merely
+-- because the directory was missing.
+for _, directory in ipairs(HEARTBEAT_DIRS) do
+    ensure_folder(directory)
+    ensure_folder(directory .. "/heartbeats")
+end
+
+print("[NOKA] Launch marker for " .. tostring(marker.package) .. " resolved from " .. tostring(marker_dir))
 
 local function begin_transition(extra_seconds)
     local now = os.time()
@@ -276,13 +289,23 @@ local function write_heartbeat(health, reason)
     local encoded_ok, body = pcall(HttpService.JSONEncode, HttpService, payload)
     if not encoded_ok then return false, tostring(body) end
 
-    -- Keep two independently readable copies. If Termux samples while one
-    -- writefile call is replacing a file, it can still read the other copy.
-    local next_ok, next_error = pcall(writefile, redundant_path, body)
-    local main_ok, main_error = pcall(writefile, heartbeat_path, body)
-    if not next_ok and not main_ok then
-        return false, tostring(main_error or next_error)
+    -- Some executors root writefile differently from readfile, so write beside
+    -- the marker AND under every candidate root. The controller reads one of
+    -- these exact paths, so at least one copy lands where it is watching. A pair
+    -- of copies per location survives a read during a replace.
+    local wrote = false
+    local last_error = nil
+    for _, directory in ipairs(HEARTBEAT_DIRS) do
+        local path = directory .. "/heartbeats/" .. safe_name(marker.package) .. ".json"
+        local ok, err = pcall(writefile, path, body)
+        if ok then
+            wrote = true
+            pcall(writefile, path .. ".next", body)
+        else
+            last_error = err
+        end
     end
+    if not wrote then return false, tostring(last_error) end
     return true
 end
 
