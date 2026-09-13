@@ -1,374 +1,177 @@
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 
-local HEARTBEAT_INTERVAL = 4
-local INITIAL_LOADING_GRACE = 12
-local TELEPORT_GRACE = 180
-local MARKER_PLAYER_WAIT = 8
-local STATE_KEY = "__NOKA_LOCALPLAYER_HEARTBEAT_V3"
-local task_library = task
-local wait_for = task_library and task_library.wait or wait
-local spawn_task = task_library and task_library.spawn or spawn
+local NOKADIR = "Noka"
+local HEARTBEATS = NOKADIR .. "/heartbeats"
+local STATE_KEY = "__NOKA_HEARTBEAT_V4"
+local WRITE_INTERVAL = 4
+local MARKER_WAIT = 10
+local MARKER_MAX_AGE = 1800
 
-if type(wait_for) ~= "function" or type(spawn_task) ~= "function" then
-    warn("[NOKA] This executor does not provide task.wait/spawn compatibility.")
+if type(writefile) ~= "function"
+    or type(readfile) ~= "function"
+    or type(makefolder) ~= "function" then
     return
 end
 
-local function environment()
-    if type(getgenv) == "function" then
-        local ok, value = pcall(getgenv)
-        if ok and type(value) == "table" then return value end
+local function ensure(path)
+    if type(isfolder) == "function" and isfolder(path) then
+        return
     end
-    return _G
+    pcall(makefolder, path)
 end
 
-local shared = environment()
+ensure(NOKADIR)
+ensure(HEARTBEATS)
 
-local function safe_read(path)
-    if type(readfile) ~= "function" then return nil end
-    local ok, contents = pcall(readfile, path)
-    if ok and type(contents) == "string" then return contents end
+local function read_json(path)
+    local ok, text = pcall(readfile, path)
+    if not ok or type(text) ~= "string" or text == "" then return nil end
+    local decoded, value = pcall(HttpService.JSONDecode, HttpService, text)
+    if decoded then return value end
     return nil
 end
 
-local function ensure_folder(path)
-    if type(isfolder) == "function" then
-        local ok, exists = pcall(isfolder, path)
-        if ok and exists then return true end
-    end
-    if type(makefolder) ~= "function" then return false end
-    return pcall(makefolder, path)
+local function valid_marker(m)
+    return type(m) == "table"
+        and type(m.package) == "string" and m.package ~= ""
+        and type(m.token) == "string" and m.token ~= ""
 end
 
-local function current_user_id()
+local function find_marker()
+    local user_marker
     local player = Players.LocalPlayer
-    if not player then return nil end
-    local ok, value = pcall(function() return player.UserId end)
-    if ok and type(value) == "number" then return value end
-    return nil
-end
-
-local function decode_marker(contents, require_fresh)
-    local ok, marker = pcall(HttpService.JSONDecode, HttpService, contents)
-    if not ok or type(marker) ~= "table" then return nil end
-    if type(marker.package) ~= "string" or marker.package == "" then return nil end
-    if type(marker.token) ~= "string" or marker.token == "" then return nil end
-    if require_fresh then
-        if type(marker.launched_at) ~= "number" then return nil end
-        if math.abs(os.time() - marker.launched_at) > 1800 then return nil end
-    end
-    return marker
-end
-
--- Two locations on purpose: the absolute Arceus X folder, and "Noka" relative to
--- the executor's workspace (Delta cannot use absolute paths). Whichever the
--- executor allows is the one that lands; normally both do.
-local NOKADIR = "/storage/emulated/0/Arceus X/Noka"
-
-local HEARTBEAT_DIRS = {
-    NOKADIR,
-    "Noka",
-}
-
-local GENERIC_MARKER_PATHS = {
-    NOKADIR .. "/current_launch.json",
-    "Noka/current_launch.json",
-}
-
-local function user_marker_paths(user_id)
-    local leaf = "launch_" .. tostring(user_id) .. ".json"
-    return {
-        NOKADIR .. "/" .. leaf,
-        "Noka/" .. leaf,
-    }
-end
-
-local function path_dir(path)
-    return path:match("^(.*)/[^/]+$") or "Noka"
-end
-
-local function read_launch_marker()
-    local user_marker, user_dir = nil, nil
-    local user_id = current_user_id()
-    if user_id then
-        for _, path in ipairs(user_marker_paths(user_id)) do
-            local contents = safe_read(path)
-            if contents then
-                local marker = decode_marker(contents, false)
-                if marker then
-                    user_marker, user_dir = marker, path_dir(path)
-                    break
-                end
-            end
+    local user_id = player and player.UserId
+    if type(user_id) == "number" then
+        local m = read_json(NOKADIR .. "/launch_" .. tostring(user_id) .. ".json")
+        if valid_marker(m) then
+            user_marker = m
         end
     end
-    local generic_marker, generic_dir = nil, nil
-    for _, path in ipairs(GENERIC_MARKER_PATHS) do
-        local contents = safe_read(path)
-        if contents then
-            local marker = decode_marker(contents, true)
-            if marker then
-                generic_marker, generic_dir = marker, path_dir(path)
-                break
-            end
-        end
+
+    local shared_marker
+    local m = read_json(NOKADIR .. "/current_launch.json")
+    if valid_marker(m)
+        and type(m.launched_at) == "number"
+        and math.abs(os.time() - m.launched_at) <= MARKER_MAX_AGE then
+        shared_marker = m
     end
-    if generic_marker and (not user_marker or generic_marker.package == user_marker.package) then
-        return generic_marker, generic_dir
+
+    if shared_marker and (not user_marker or shared_marker.package == user_marker.package) then
+        return shared_marker
     end
-    if user_marker then
-        return user_marker, user_dir
-    end
-    return nil, nil
+    return user_marker
 end
 
+local marker
+local deadline = os.time() + MARKER_WAIT
+repeat
+    marker = find_marker()
+    if not marker then
+        task.wait(0.5)
+    end
+until marker or os.time() >= deadline
+if not marker then
+    warn("[NOKA] launch marker not found; start this clone through Noka")
+    return
+end
+
+local shared = getgenv and getgenv() or _G
 local previous = shared[STATE_KEY]
 if type(previous) == "table" then
     previous.running = false
-    if previous.teleport_connection then pcall(previous.teleport_connection.Disconnect, previous.teleport_connection) end
-end
-
-local player_wait = 0
-while player_wait < MARKER_PLAYER_WAIT and not Players.LocalPlayer do
-    wait_for(0.5)
-    player_wait = player_wait + 0.5
-end
-
-local marker = type(previous) == "table" and previous.marker or nil
-local marker_dir = type(previous) == "table" and previous.marker_dir or nil
-if type(marker) ~= "table" then
-    for _ = 1, 20 do
-        marker, marker_dir = read_launch_marker()
-        if type(marker) == "table" then break end
-        wait_for(1)
+    if previous.connection then
+        pcall(previous.connection.Disconnect, previous.connection)
     end
 end
-if type(marker) ~= "table" then
-    warn("[NOKA] Launch marker unavailable; start this clone through Noka.")
-    return
-end
-marker_dir = marker_dir or "Noka"
 
-local started_at = os.time()
 local state = {
     running = true,
-    marker = marker,
-    marker_dir = marker_dir,
-    sequence = type(previous) == "table" and tonumber(previous.sequence) or 0,
-    last_player_name = type(previous) == "table" and previous.last_player_name or nil,
-    last_display_name = type(previous) == "table" and previous.last_display_name or nil,
-    last_user_id = type(previous) == "table" and previous.last_user_id or nil,
-    transition_started_at = type(previous) == "table" and previous.transition_started_at or started_at,
-    loading_until = started_at + INITIAL_LOADING_GRACE,
-    prompt_hits = 0,
-    bound_player = nil,
-    teleport_connection = nil,
+    sequence = 0,
+    current = "loading",
+    transition_started_at = os.time(),
+    connection = nil,
 }
 shared[STATE_KEY] = state
 
-local function safe_name(value)
-    return tostring(value):gsub("[^%w%._%-]", "_")
-end
-
-for _, directory in ipairs(HEARTBEAT_DIRS) do
-    ensure_folder(directory)
-    ensure_folder(directory .. "/heartbeats")
-end
-
-print("[NOKA] Launch marker for " .. tostring(marker.package) .. " resolved from " .. tostring(marker_dir))
-
-local function begin_transition(extra_seconds)
-    local now = os.time()
-    state.transition_started_at = state.transition_started_at or now
-    state.loading_until = math.max(state.loading_until or 0, now + (extra_seconds or INITIAL_LOADING_GRACE))
-end
-
-local write_heartbeat
-
-local function bind_teleport_event(player)
-    if player == state.bound_player then return end
-    if state.teleport_connection then
-        pcall(state.teleport_connection.Disconnect, state.teleport_connection)
-        state.teleport_connection = nil
-    end
-    state.bound_player = player
-    if not player then return end
-    local ok, connection = pcall(function()
-        return player.OnTeleport:Connect(function()
-            state.transition_started_at = os.time()
-            state.loading_until = math.max(state.loading_until or 0, os.time() + TELEPORT_GRACE)
-            pcall(function() write_heartbeat("teleporting", "serverhop") end)
-        end)
-    end)
-    if ok then state.teleport_connection = connection end
-end
-
-local function safe_property(instance, key)
-    local ok, value = pcall(function()
-        return instance[key]
-    end)
+local function property(instance, key)
+    local ok, value = pcall(function() return instance[key] end)
     if ok then return value end
     return nil
 end
 
-local function sample_local_player()
+local function heartbeat(health)
+    state.sequence = state.sequence + 1
     local player = Players.LocalPlayer
-    bind_teleport_event(player)
-    if player then
-        state.last_player_name = safe_property(player, "Name")
-            or state.last_player_name
-        state.last_display_name = safe_property(player, "DisplayName")
-            or state.last_display_name
-        state.last_user_id = safe_property(player, "UserId")
-            or state.last_user_id
-    end
-    return player
-end
-
-local function game_is_loaded()
-    local ok, loaded = pcall(game.IsLoaded, game)
-    return ok and loaded == true
-end
-
-local DISCONNECT_TERMS = {
-    "disconnect", "connection", "reconnect", "kicked", "internet",
-    "teleport failed", "error code", "koneksi", "terputus", "gagal",
-    "264", "266", "267", "268", "271", "272", "273", "274",
-    "275", "277", "278", "279", "280", "282", "284", "285",
-    "286", "524", "529", "610", "769", "770", "771", "772", "773",
-}
-
-local function visible_disconnect_prompt()
-    local ok, core_gui = pcall(game.GetService, game, "CoreGui")
-    if not ok or not core_gui then return false end
-    local prompt_gui = core_gui:FindFirstChild("RobloxPromptGui")
-    if not prompt_gui then return false end
-    local overlay = prompt_gui:FindFirstChild("promptOverlay")
-        or prompt_gui:FindFirstChild("PromptOverlay")
-    if not overlay then return false end
-    local error_prompt = overlay:FindFirstChild("ErrorPrompt")
-    if not error_prompt or not error_prompt.Visible then return false end
-
-    local reason
-    local descendants_ok, descendants = pcall(error_prompt.GetDescendants, error_prompt)
-    if descendants_ok then
-        for _, descendant in ipairs(descendants) do
-            local label_ok, is_label = pcall(descendant.IsA, descendant, "TextLabel")
-            if label_ok and is_label and descendant.Visible then
-                local original = tostring(descendant.Text or "")
-                local lowered = string.lower(original)
-                for _, term in ipairs(DISCONNECT_TERMS) do
-                    if string.find(lowered, term, 1, true) then
-                        reason = string.sub(original, 1, 160)
-                        break
-                    end
-                end
-            end
-            if reason then break end
-        end
-    end
-    return true, reason or "Roblox ErrorPrompt visible"
-end
-
-write_heartbeat = function(health, reason)
-    if type(writefile) ~= "function" then return false, "writefile is unavailable" end
-    local now = os.time()
-    local player = sample_local_player()
-    local loaded = game_is_loaded()
-
-    if health ~= "teleporting" and health ~= "disconnected" then
-        if not loaded or not player then begin_transition(30) end
-        local loading = not loaded or not player or now < (state.loading_until or 0)
-        if not loading then state.transition_started_at = nil end
-        health = loading and "loading" or "active"
-    end
-
-    state.sequence = (state.sequence or 0) + 1
     local payload = {
         package = marker.package,
         token = marker.token,
-        timestamp = now,
-        sequence = state.sequence,
         state = health,
+        timestamp = os.time(),
+        sequence = state.sequence,
         online = health ~= "disconnected",
         transitioning = health == "loading" or health == "teleporting",
         transition_started_at = state.transition_started_at,
-        player_ready = player ~= nil,
-        player = state.last_player_name,
-        display_name = state.last_display_name,
-        user_id = state.last_user_id,
-        place_id = safe_property(game, "PlaceId"),
-        job_id = safe_property(game, "JobId"),
+        place_id = tostring(property(game, "PlaceId") or ""),
+        job_id = tostring(property(game, "JobId") or ""),
+        player = player and property(player, "Name"),
+        user_id = player and property(player, "UserId"),
     }
-    if reason then payload.reason = reason end
-
-    local encoded_ok, body = pcall(HttpService.JSONEncode, HttpService, payload)
-    if not encoded_ok then return false, tostring(body) end
-
-    local wrote = false
-    local last_error = nil
-    for _, directory in ipairs(HEARTBEAT_DIRS) do
-        local path = directory .. "/heartbeats/" .. safe_name(marker.package) .. ".json"
-        local ok, err = pcall(writefile, path, body)
-        if ok then
-            wrote = true
-            pcall(writefile, path .. ".next", body)
-        else
-            last_error = err
-        end
+    local encoded, body = pcall(HttpService.JSONEncode, HttpService, payload)
+    if not encoded then
+        return
     end
-    if not wrote then return false, tostring(last_error) end
-    return true
+    local path = HEARTBEATS .. "/" .. marker.package:gsub("[^%w%._%-]", "_") .. ".json"
+    pcall(writefile, path, body)
+    pcall(writefile, path .. ".next", body)
 end
 
-write_heartbeat("loading")
+local function teleporting()
+    state.current = "teleporting"
+    state.transition_started_at = os.time()
+    heartbeat("teleporting")
+end
 
-spawn_task(function()
-    local next_write = 0
-    local disconnect_warning_sent = false
-    local write_warning_sent = false
-    local tick_error_count = 0
+local function error_prompt_visible()
+    local core = game:GetService("CoreGui")
+    local gui = core:FindFirstChild("RobloxPromptGui")
+    local overlay = gui and gui:FindFirstChild("promptOverlay")
+    local prompt = overlay and overlay:FindFirstChild("ErrorPrompt")
+    return prompt ~= nil and prompt.Visible == true
+end
+
+local function ready()
+    local ok, loaded = pcall(game.IsLoaded, game)
+    return ok and loaded == true and Players.LocalPlayer ~= nil
+end
+
+local player = Players.LocalPlayer
+if player and player.OnTeleport then
+    local connected, connection = pcall(function()
+        return player.OnTeleport:Connect(teleporting)
+    end)
+    if connected then
+        state.connection = connection
+    end
+end
+
+heartbeat("loading")
+
+task.spawn(function()
     while state.running and shared[STATE_KEY] == state do
-        local now = os.time()
-        if now >= next_write then
-            next_write = now + HEARTBEAT_INTERVAL
-            local tick_ok, tick_error = pcall(function()
-                local prompt_visible, reason = false, nil
-                local checked, check_error = pcall(function()
-                    prompt_visible, reason = visible_disconnect_prompt()
-                end)
-                if checked and prompt_visible then
-                    state.prompt_hits = math.min(2, state.prompt_hits + 1)
-                else
-                    state.prompt_hits = 0
-                end
-                if not checked and not disconnect_warning_sent then
-                    disconnect_warning_sent = true
-                    warn("[NOKA] Disconnect check failed: " .. tostring(check_error))
-                end
+        task.wait(WRITE_INTERVAL)
 
-                local health = state.prompt_hits >= 2 and "disconnected" or nil
-                local written, write_error = write_heartbeat(health, health and reason or nil)
-                if not written and not write_warning_sent then
-                    write_warning_sent = true
-                    warn("[NOKA] Heartbeat write failed: " .. tostring(write_error))
-                end
-            end)
-            if not tick_ok then
-                tick_error_count = tick_error_count + 1
-                if tick_error_count <= 5 then
-                    warn("[NOKA] Heartbeat tick error (" .. tick_error_count .. "): " .. tostring(tick_error))
-                end
-            end
+        local prompt_ok, prompt = pcall(error_prompt_visible)
+        if prompt_ok and prompt then
+            state.current = "disconnected"
+        elseif ready() then
+            state.current = "active"
+            state.transition_started_at = nil
+        elseif state.current ~= "teleporting" and state.current ~= "disconnected" then
+            state.current = "loading"
+            state.transition_started_at = state.transition_started_at or os.time()
         end
-        wait_for(1)
-    end
-    if state.teleport_connection then
-        pcall(state.teleport_connection.Disconnect, state.teleport_connection)
-        state.teleport_connection = nil
-    end
-    state.bound_player = nil
-end)
 
-print("[NOKA] Resilient LocalPlayer heartbeat connected.")
+        heartbeat(state.current)
+    end
+end)
