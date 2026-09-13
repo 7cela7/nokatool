@@ -61,17 +61,25 @@ local function decode_marker(contents, require_fresh)
     return marker
 end
 
+-- Two locations on purpose: the absolute Arceus X folder, and "Noka" relative to
+-- the executor's workspace (Delta cannot use absolute paths). Whichever the
+-- executor allows is the one that lands; normally both do.
+local NOKADIR = "/storage/emulated/0/Arceus X/Noka"
+
 local HEARTBEAT_DIRS = {
+    NOKADIR,
     "Noka",
 }
 
 local GENERIC_MARKER_PATHS = {
+    NOKADIR .. "/current_launch.json",
     "Noka/current_launch.json",
 }
 
 local function user_marker_paths(user_id)
     local leaf = "launch_" .. tostring(user_id) .. ".json"
     return {
+        NOKADIR .. "/" .. leaf,
         "Noka/" .. leaf,
     }
 end
